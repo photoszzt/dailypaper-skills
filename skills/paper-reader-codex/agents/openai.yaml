@@ -1,0 +1,4 @@
+interface:
+  display_name: "Paper Reader"
+  short_description: "Read ACM, arXiv, and PDF papers into notes"
+  default_prompt: "Read a paper from DOI, ACM Digital Library, arXiv, local PDF, or Zotero and generate structured notes."
