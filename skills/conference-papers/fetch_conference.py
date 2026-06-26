@@ -29,12 +29,44 @@ for p in [str(_SHARED_DIR), str(_DAILY_DIR)]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from user_config import daily_papers_config
+from user_config import daily_papers_config, daily_papers_dir
 from fetch_and_score import (
     score_paper,
     fetch_url,
     _normalize_title,
 )
+
+CACHE_DIR = daily_papers_dir()
+
+
+def _cache_path(venue: str, year: int) -> Path:
+    return CACHE_DIR / f".conf_cache_{venue}_{year}.json"
+
+
+def _load_cache(venue: str, year: int) -> list[dict] | None:
+    path = _cache_path(venue, year)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        papers = data.get("papers", [])
+        print(f"  Using cached {venue} {year} ({len(papers)} papers)", file=sys.stderr)
+        return papers
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def _save_cache(venue: str, year: int, papers: list[dict]) -> None:
+    path = _cache_path(venue, year)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(
+            {"venue": venue, "year": year, "fetched": datetime.now().isoformat(),
+             "count": len(papers), "papers": papers},
+            ensure_ascii=False,
+        ), encoding="utf-8")
+    except IOError as e:
+        print(f"  [WARN] failed to write cache: {e}", file=sys.stderr)
 
 KNOWN_VENUES = {
     "ASPLOS":  {"dblp_key": "conf/asplos",  "org": "ACM",      "query": "ASPLOS"},
@@ -206,7 +238,13 @@ def _parse_hits(hits: list, dblp_key: str, venue_name: str, year: int,
 
 
 def fetch_conference(venue_name: str, dblp_key: str, year: int,
-                     search_query: str | None = None) -> list[dict]:
+                     search_query: str | None = None,
+                     refresh: bool = False) -> list[dict]:
+    if not refresh:
+        cached = _load_cache(venue_name, year)
+        if cached is not None:
+            return cached
+
     q_term = search_query or venue_name
     query = quote_plus(f"{q_term} {year}")
     page_size = 1000
@@ -254,6 +292,10 @@ def fetch_conference(venue_name: str, dblp_key: str, year: int,
 
     papers.sort(key=lambda p: (-p["score"], p["category"], p["title"]))
     print(f"  {venue_name} {year}: {len(papers)} papers", file=sys.stderr)
+
+    if papers:
+        _save_cache(venue_name, year, papers)
+
     return papers
 
 
@@ -289,6 +331,8 @@ def main():
                         help="Output format (default: json)")
     parser.add_argument("--list-venues", action="store_true",
                         help="List all known conference venues")
+    parser.add_argument("--refresh", action="store_true",
+                        help="Ignore cache and re-fetch from DBLP")
     args = parser.parse_args()
 
     if args.list_venues:
@@ -306,7 +350,8 @@ def main():
         sys.exit(1)
 
     papers = fetch_conference(venue_info["name"], venue_info["dblp_key"], args.year,
-                              search_query=venue_info.get("query"))
+                              search_query=venue_info.get("query"),
+                              refresh=args.refresh)
 
     if args.format == "markdown":
         print(format_markdown(papers, venue_info["name"], args.year))
