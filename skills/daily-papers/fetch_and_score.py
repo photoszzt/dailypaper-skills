@@ -17,10 +17,12 @@ import argparse
 import json
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.error import URLError
+from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
 _SHARED_DIR = Path(__file__).resolve().parent.parent / "_shared"
@@ -39,6 +41,7 @@ DOMAIN_BOOST_KEYWORDS = _CONFIG["domain_boost_keywords"]
 ARXIV_CATEGORIES = _CONFIG["arxiv_categories"]
 MIN_SCORE = _CONFIG["min_score"]
 TOP_N = _CONFIG["top_n"]
+CONFERENCE_VENUES = _CONFIG.get("conference_venues", [])
 
 DAILYPAPERS_DIR = daily_papers_dir()
 HISTORY_PATH = DAILYPAPERS_DIR / ".history.json"
@@ -101,17 +104,49 @@ def score_paper(paper: dict, is_trending: bool = False) -> int:
     return score
 
 
+# ── SSL context (fixes macOS Python cert issues) ─────────────────────────
+
+
+def _build_ssl_context():
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+_SSL_CTX = None
+
+
 # ── Fetchers ───────────────────────────────────────────────────────────────
 
 
-def fetch_url(url: str, timeout: int = 30) -> str:
-    try:
-        req = Request(url, headers={"User-Agent": "daily-papers-bot/1.0"})
-        with urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
-    except Exception as e:
-        print(f"  [WARN] fetch failed {url}: {e}", file=sys.stderr)
-        return ""
+def fetch_url(url: str, timeout: int = 30, retries: int = 2) -> str:
+    from urllib.error import HTTPError
+    ctx = _SSL_CTX
+    if ctx is None:
+        globals()["_SSL_CTX"] = _build_ssl_context()
+        ctx = _SSL_CTX
+    for attempt in range(1, retries + 1):
+        try:
+            req = Request(url, headers={"User-Agent": "daily-papers-bot/1.0"})
+            with urlopen(req, timeout=timeout, context=ctx) as resp:
+                return resp.read().decode("utf-8")
+        except HTTPError as e:
+            if e.code == 429:
+                wait = int(e.headers.get("Retry-After", 5))
+                print(f"  [429] Rate limited, waiting {wait}s (attempt {attempt})...", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            print(f"  [WARN] fetch failed {url}: {e}", file=sys.stderr)
+            return ""
+        except Exception as e:
+            print(f"  [WARN] fetch failed {url}: {e}", file=sys.stderr)
+            return ""
+    return ""
 
 
 def _parse_hf_item(item: dict, source: str) -> tuple[str, dict] | None:
@@ -312,12 +347,173 @@ def fetch_arxiv_papers(start_date=None, end_date=None, days: int = 1) -> list[di
     return scored
 
 
+# ── Conference papers from DBLP ───────────────────────────────────────────
+
+
+def _dblp_fetch(url: str, timeout: int = 30) -> str:
+    """Fetch URL with proper SSL context for DBLP (same as fetch_url)."""
+    return fetch_url(url, timeout=timeout)
+
+
+def _load_dblp_cache() -> list[dict] | None:
+    """Return cached DBLP papers if cache is from today, else None."""
+    cache_path = DAILYPAPERS_DIR / ".dblp_cache.json"
+    if not cache_path.exists():
+        return None
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        if data.get("date") == datetime.now().date().isoformat():
+            print("  DBLP: using today's cache", file=sys.stderr)
+            return data.get("papers", [])
+    except (json.JSONDecodeError, IOError):
+        pass
+    return None
+
+
+def _save_dblp_cache(papers: list[dict]) -> None:
+    cache_path = DAILYPAPERS_DIR / ".dblp_cache.json"
+    try:
+        cache_path.write_text(json.dumps(
+            {"date": datetime.now().date().isoformat(), "papers": papers},
+            ensure_ascii=False,
+        ), encoding="utf-8")
+    except IOError as e:
+        print(f"  [WARN] failed to write DBLP cache: {e}", file=sys.stderr)
+
+
+def _parse_dblp_hits(hits: list, dblp_key: str, vname: str,
+                      seen_titles: set[str]) -> list[dict]:
+    """Parse DBLP search hits into paper dicts."""
+    papers = []
+    for hit in hits:
+        info = hit.get("info", {})
+
+        if info.get("type", "") not in ("Conference and Workshop Papers", ""):
+            continue
+
+        dblp_url = info.get("url", "")
+        if dblp_key not in dblp_url:
+            continue
+
+        title = info.get("title", "").rstrip(".")
+        title_key = _normalize_title(title)
+        if not title_key or title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+
+        authors_data = info.get("authors", {})
+        author_list = authors_data.get("author", [])
+        if isinstance(author_list, dict):
+            author_list = [author_list]
+        authors = ", ".join(
+            a.get("text", "") if isinstance(a, dict) else str(a)
+            for a in author_list
+        )
+
+        paper_url = info.get("ee", "")
+        if isinstance(paper_url, list):
+            paper_url = paper_url[0] if paper_url else ""
+        if not paper_url:
+            paper_url = dblp_url
+
+        year = info.get("year", "")
+
+        paper = {
+            "title": title,
+            "authors": authors,
+            "affiliations": "",
+            "abstract": "",
+            "url": paper_url,
+            "pdf": "",
+            "date": f"{year}-01-01" if year else "",
+            "score": 0,
+            "category": "",
+            "source": f"dblp-{vname}",
+            "venue": vname,
+        }
+
+        base_score = score_paper(paper)
+        paper["score"] = max(base_score, 0) + 5
+        papers.append(paper)
+    return papers
+
+
+def fetch_conference_papers() -> list[dict]:
+    """Fetch recent conference papers from DBLP for configured venues.
+
+    Results are cached daily to avoid hammering DBLP's API.
+    """
+    cached = _load_dblp_cache()
+    if cached is not None:
+        return cached
+
+    current_year = datetime.now().year
+    years = [current_year]
+
+    papers = []
+    seen_titles: set[str] = set()
+    consecutive_failures = 0
+
+    for venue in CONFERENCE_VENUES:
+        vname = venue["name"]
+        dblp_key = venue["dblp_key"]
+
+        if consecutive_failures >= 3:
+            print(f"  DBLP: skipping remaining venues after {consecutive_failures} consecutive failures",
+                  file=sys.stderr)
+            break
+
+        for year in years:
+            query = quote_plus(f"{vname} {year}")
+            url = (
+                f"https://dblp.org/search/publ/api?"
+                f"q={query}&h=300&format=json"
+            )
+
+            time.sleep(3.0)
+            raw = _dblp_fetch(url, timeout=30)
+            if not raw:
+                consecutive_failures += 1
+                continue
+
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                consecutive_failures += 1
+                continue
+
+            consecutive_failures = 0
+            hits = data.get("result", {}).get("hits", {}).get("hit", [])
+            venue_papers = _parse_dblp_hits(hits, dblp_key, vname, seen_titles)
+            papers.extend(venue_papers)
+
+        count = sum(1 for p in papers if p["venue"] == vname)
+        if count:
+            print(f"  DBLP {vname}: {count} papers", file=sys.stderr)
+
+    print(f"  DBLP total: {len(papers)} conference papers", file=sys.stderr)
+    _save_dblp_cache(papers)
+    return papers
+
+
 # ── Merge & Dedup ──────────────────────────────────────────────────────────
 
 
 def extract_arxiv_id(url: str) -> str:
     m = re.search(r"(\d{4}\.\d{4,5})", url)
     return m.group(1) if m else ""
+
+
+def _normalize_title(title: str) -> str:
+    return re.sub(r'[^a-z0-9\s]', '', title.lower()).strip()
+
+
+def _paper_key(paper: dict) -> str:
+    aid = extract_arxiv_id(paper.get("url", ""))
+    if aid:
+        return f"arxiv:{aid}"
+    title = _normalize_title(paper.get("title", ""))
+    return f"title:{title}" if title else ""
 
 
 def load_history() -> list[dict]:
@@ -347,20 +543,38 @@ def load_fallback_ids(days: int = 7) -> set[str]:
 def merge_and_dedup(
     hf_papers: list[dict],
     arxiv_papers: list[dict],
+    conference_papers: list[dict],
     target_date,
     days: int = 1,
     top_n: int = TOP_N,
 ) -> list[dict]:
     is_weekend = target_date.weekday() >= 5
 
-    # ── merge by arXiv ID, keep higher score ──
+    # ── merge by paper key (arXiv ID or title), keep higher score ──
     by_id: dict[str, dict] = {}
-    for p in hf_papers + arxiv_papers:
-        aid = extract_arxiv_id(p["url"])
-        if not aid:
+    for p in hf_papers + arxiv_papers + conference_papers:
+        key = _paper_key(p)
+        if not key:
             continue
-        if aid not in by_id or p["score"] > by_id[aid]["score"]:
-            by_id[aid] = p
+        if key not in by_id or p["score"] > by_id[key]["score"]:
+            by_id[key] = p
+
+    # ── title-based cross-source dedup (arXiv + DBLP overlap) ──
+    title_index: dict[str, list[str]] = {}
+    for key in list(by_id.keys()):
+        norm = _normalize_title(by_id[key].get("title", ""))
+        if norm:
+            title_index.setdefault(norm, []).append(key)
+    for norm, keys in title_index.items():
+        if len(keys) > 1:
+            best = max(keys, key=lambda k: (k.startswith("arxiv:"), by_id[k]["score"]))
+            for k in keys:
+                if k != best:
+                    venue = by_id[k].get("venue", "")
+                    if venue and not by_id[best].get("venue"):
+                        by_id[best]["venue"] = venue
+                    by_id[best]["score"] = max(by_id[best]["score"], by_id[k]["score"])
+                    del by_id[k]
 
     print(f"  Merged: {len(by_id)} unique papers", file=sys.stderr)
 
@@ -387,24 +601,26 @@ def merge_and_dedup(
         for fid in load_fallback_ids():
             history_ids.setdefault(fid, "unknown")
 
-    # ── cross-day dedup ──
+    # ── cross-day dedup (arXiv papers only; conference papers bypass) ──
     deduped: dict[str, dict] = {}
     removed = 0
-    for aid, p in by_id.items():
-        if aid in history_ids:
+    for key, p in by_id.items():
+        aid = key[6:] if key.startswith("arxiv:") else ""
+        if aid and aid in history_ids:
             # Weekend: keep trending with upvotes >= 5
             if is_weekend and p.get("source") == "hf-trending" and (p.get("hf_upvotes") or 0) >= 5:
                 p["is_re_recommend"] = True
                 p["last_recommend_date"] = history_ids[aid]
-                deduped[aid] = p
+                deduped[key] = p
             else:
                 removed += 1
         else:
-            deduped[aid] = p
+            deduped[key] = p
 
     # Mark any remaining that appear in history
-    for aid, p in deduped.items():
-        if aid in history_ids and not p.get("is_re_recommend"):
+    for key, p in deduped.items():
+        aid = key[6:] if key.startswith("arxiv:") else ""
+        if aid and aid in history_ids and not p.get("is_re_recommend"):
             p["is_re_recommend"] = True
             p["last_recommend_date"] = history_ids[aid]
 
@@ -417,10 +633,11 @@ def merge_and_dedup(
     # Back-fill from history if pool is thin
     if len(candidates) < 20 and removed > 0:
         backfill = []
-        for aid, p in by_id.items():
-            if aid not in deduped and p["score"] >= MIN_SCORE:
+        for key, p in by_id.items():
+            if key not in deduped and p["score"] >= MIN_SCORE:
+                aid = key[6:] if key.startswith("arxiv:") else ""
                 p["is_re_recommend"] = True
-                p["last_recommend_date"] = history_ids.get(aid, "unknown")
+                p["last_recommend_date"] = history_ids.get(aid, "unknown") if aid else "unknown"
                 backfill.append(p)
         backfill.sort(key=lambda x: x["score"], reverse=True)
         needed = 20 - len(candidates)
@@ -460,7 +677,8 @@ def main():
 
     hf_papers = fetch_hf_papers(start_date, target_date)
     arxiv_papers = fetch_arxiv_papers(start_date, target_date, days)
-    top = merge_and_dedup(hf_papers, arxiv_papers, target_date, days=days, top_n=top_n)
+    conf_papers = fetch_conference_papers() if CONFERENCE_VENUES else []
+    top = merge_and_dedup(hf_papers, arxiv_papers, conf_papers, target_date, days=days, top_n=top_n)
 
     # Output to stdout (UTF-8 encoded for Windows compatibility)
     import io

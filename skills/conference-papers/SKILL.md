@@ -16,6 +16,8 @@ description: |
 
 Fetch, score, and categorize all papers from a systems conference proceeding.
 
+**Output language: English.** All summaries, categories, evaluations, and saved files must be in English.
+
 ## Step 0: Read config
 
 Read `../_shared/user-config.json` (and `user-config.local.json` if present) for:

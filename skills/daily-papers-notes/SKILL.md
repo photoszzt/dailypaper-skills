@@ -11,6 +11,8 @@ description: |
 
 # 论文笔记 (Concepts + Notes + Backfill)
 
+**Output language: English.** All generated paper notes and concept notes must be written in English.
+
 你是 用户的论文笔记系统（3 步流水线的第 3 步）。补充概念库 → 生成论文笔记 → 链接回填 → 刷新目录页。
 
 ## Step 0: 读取共享配置
@@ -75,11 +77,26 @@ description: |
    - 对已有 `📒 **笔记**` 标记的论文，用 Glob 找到对应笔记文件，检查行数
    - **行数 < 100 的视为骨架笔记，必须重新生成**（删除旧文件，重新调用 paper-reader）
    - 行数 >= 100 且包含 `## 关键公式` 和 `## 关键图表` 的才算合格，可以跳过
-3. 对每篇需要生成/重新生成的论文，使用 Task agent 调用 `/paper-reader` skill（传入 arXiv 链接）
-   - **不要指定固定的输出路径**，让 paper-reader 自行决定文件名和分类目录
-   - paper-reader 会用方法名缩写作为文件名（如 `DAPL.md`），并自动分类到正确子目录
+3. 对每篇需要生成/重新生成的论文，**按以下优先级获取可读内容**：
+
+   **Step 3a: 寻找最佳来源**（ACM DL 是最后手段）
+   1. 检查论文是否有 arXiv URL（URL 包含 `arxiv.org`）→ 直接用 arXiv 链接
+   2. 如果论文来自 DBLP（`source` 以 `dblp-` 开头）但没有 arXiv URL：
+      - 先用论文标题在 arXiv 搜索（`https://arxiv.org/search/?query=标题`），很多系统论文有 arXiv 预印本
+      - 如果找到 arXiv 版本 → 用 arXiv 链接
+      - 如果找不到，检查论文 URL 是否指向 USENIX（`usenix.org`）→ USENIX 论文通常可直接下载 PDF
+      - 以上都不行 → 使用 ACM DL URL（DOI 或 `dl.acm.org` 链接）
+   3. 如果 ACM DL 也失败（Cloudflare 拦截），告知用户需要手动下载，提供 URL 和建议的保存路径
+
+   **Step 3b: 调用对应 reader**
+   - arXiv 链接 → 使用 Task agent 调用 `/paper-reader` skill
+   - USENIX 直接 PDF → 使用 Task agent 调用 `/paper-reader` skill（传入 PDF URL）
+   - DOI / ACM DL URL → 使用 Task agent 调用 `/paper-reader-codex` skill
+   - 本地 PDF（用户手动下载后）→ 使用 `/paper-reader`
+   - **不要指定固定的输出路径**，让 reader 自行决定文件名和分类目录
+   - reader 会用方法名缩写作为文件名（如 `DAPL.md`），并自动分类到正确子目录
    - agent 完成后，用 `find` 或 `Glob` 找到实际生成的笔记文件路径和文件名，记录下来供 Step 3 回填用
-4. 笔记生成后，paper-reader 会自动补充概念库，无需重复
+4. 笔记生成后，reader 会自动补充概念库，无需重复
 
 > **铁律**：不论论文数量多少，"必读"的论文**全部**生成笔记，一篇不能少。
 > 耗时长是正常的，不是偷懒的理由。如果 context 接近上限，先把已完成内容落盘；
@@ -87,11 +104,11 @@ description: |
 
 #### ⚠️ 笔记质量硬性要求
 
-**绝对禁止自己手写简化版笔记。每篇论文必须通过 Task agent 调用 `/paper-reader` skill 生成。**
+**绝对禁止自己手写简化版笔记。每篇论文必须通过 Task agent 调用 `/paper-reader` 或 `/paper-reader-codex` skill 生成。**
 不要因为"怕 context overflow"或"论文太多"就自己写个 70 行的骨架糊弄过去。
-paper-reader 在独立的 Task agent 中运行，不会占用主 agent 的 context。
+reader 在独立的 Task agent 中运行，不会占用主 agent 的 context。
 
-笔记质量由 paper-reader skill 自身保证（模板、公式、图片、概念链接等规则均在 paper-reader 中定义）。
+笔记质量由 reader skill 自身保证（模板、公式、图片、概念链接等规则均在 reader 中定义）。
 
 #### 🔍 生成后质量验证（每篇必须执行）
 

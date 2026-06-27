@@ -13,6 +13,10 @@ description: |
 
 你是 用户的论文点评系统（3 步流水线的第 2 步）。读取富化数据 → 扫描笔记库 → 生成推荐点评 → 保存到 Obsidian。
 
+## ⚠️ Output Language
+
+**All generated output (the recommendation file saved to Obsidian) MUST be written in English.** This includes section headers, reviews, comments, triage table, and trend analysis. The only exceptions are directory names that already exist in Chinese (e.g., `论文笔记/`, `DailyPapers/`).
+
 ## Step 0: 读取共享配置
 
 先读取 `../_shared/user-config.json`，如果 `../_shared/user-config.local.json` 存在，再用它覆盖默认值。
@@ -83,8 +87,13 @@ description: |
 
 **来源格式规则**（按 source 字段分别显示）：
 - `hf-daily` → `📰 HF Daily，⬆️ {hf_upvotes}`
-- `hf-trending` → 🔥 HF Trending，⬆️ {hf_upvotes}`
+- `hf-trending` → `🔥 HF Trending，⬆️ {hf_upvotes}`
 - `arxiv` → `📄 arXiv 关键词检索`（不显示 upvotes，因为没有）
+- `dblp-*`（如 `dblp-SOSP`）→ `🏛️ {venue}` — 显示论文的 venue 字段（如 SOSP、OSDI、SIGCOMM）
+
+**链接格式规则**（按论文 URL 类型）：
+- arXiv URL → `[arXiv](https://arxiv.org/abs/XXXX) | [PDF](https://arxiv.org/pdf/XXXX)`
+- DOI / ACM DL URL → `[Paper](论文URL)`。如果 URL 包含 `doi.org` 或 `dl.acm.org`，显示为 `[ACM DL](URL)`
 
 #### 兜底过滤
 
@@ -162,7 +171,7 @@ description: |
 
 ```markdown
 ### N. 论文标题
-- **链接**: [arXiv](https://arxiv.org/abs/XXXX) | [PDF](https://arxiv.org/pdf/XXXX)
+- **链接**: {见下方链接格式}
 - **来源**: {见下方来源格式}
 
 > ⏪ **再推提醒**：这篇在 {last_recommend_date} 推荐过
@@ -177,7 +186,7 @@ description: |
 ### N. 论文标题
 - **作者**: 完整作者列表（优先使用富化的 authors 字段，其次用原始 authors 字段）
 - **机构**: 从富化的 affiliations 字段获取，列出所有机构。如果 affiliations 为空，再检查原始 affiliations 字段。都没有则写"未知"
-- **链接**: [arXiv](https://arxiv.org/abs/XXXX) | [PDF](https://arxiv.org/pdf/XXXX)
+- **链接**: {见下方链接格式}
 - **来源**: {见下方来源格式}
 
 > ⏪ **再推提醒**：这篇在 {last_recommend_date} 推荐过
